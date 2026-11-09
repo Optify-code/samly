@@ -138,4 +138,25 @@ defmodule SamlySPHandlerTest do
       assert conn.resp_body == "access_denied :invalid_in_response_to"
     end
   end
+
+  describe "unsolicited responses" do
+    test "refuses a response without InResponseTo when IdP-initiated sign-in is off" do
+      setup_provider(@unsigned)
+
+      conn = post_consume(response_xml(in_response_to: nil))
+
+      assert conn.status == 403
+      assert conn.resp_body == "access_denied :idp_first_flow_not_allowed"
+      assert get_session(conn, "samly_assertion_key") == nil
+    end
+
+    test "accepts a response without InResponseTo when IdP-initiated sign-in is on" do
+      setup_provider(Map.put(@unsigned, :allow_idp_initiated_flow, true))
+
+      conn = post_consume(response_xml(in_response_to: nil), default_session(), "/landing")
+
+      assert conn.status == 302
+      assert get_resp_header(conn, "location") == ["/landing"]
+    end
+  end
 end
