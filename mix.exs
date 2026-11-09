@@ -29,7 +29,7 @@ defmodule Samly.Mixfile do
   defp deps() do
     [
       {:plug, "~> 1.6"},
-      {:esaml, "~> 4.3"},
+      {:esaml, git: "git@github.com:Optify-code/esaml.git", tag: "v4.6.0-optify.1"},
       {:sweet_xml, "~> 0.6"},
       {:dialyxir, "~> 1.0", only: [:dev], runtime: false},
       {:ex_doc, "~> 0.19", only: :dev, runtime: false}
