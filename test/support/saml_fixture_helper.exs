@@ -128,6 +128,22 @@ defmodule Samly.TestSAML do
     |> Samly.Router.call(Samly.Router.init([]))
   end
 
+  # Calls Samly.AuthHandler.send_signin_req/1 directly. This skips the CSRF check.
+  def send_signin(idp) do
+    conn(:post, "/auth/signin/idp1")
+    |> init_test_session(%{})
+    |> Plug.Conn.put_private(:samly_idp, idp)
+    |> Plug.Conn.put_private(:samly_nonce, "n")
+    |> Plug.Conn.put_private(:samly_target_url, "/home")
+    |> Samly.AuthHandler.send_signin_req()
+  end
+
+  # Returns the value of a hidden form field in an esaml HTTP-POST page.
+  def form_value(body, name) do
+    [_, value] = Regex.run(~r/name="#{name}" value="([^"]*)"/, body)
+    value
+  end
+
   defp sign(assertion) do
     key = :esaml_util.load_private_key(~c"test/data/test.pem")
     cert = :esaml_util.load_certificate(~c"test/data/test.crt")

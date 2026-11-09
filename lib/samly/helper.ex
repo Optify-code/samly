@@ -2,6 +2,7 @@ defmodule Samly.Helper do
   @moduledoc false
 
   require Samly.Esaml
+  import SweetXml, only: [sigil_x: 2, xpath: 2]
   alias Samly.{Assertion, Esaml, IdpData}
 
   @spec get_idp(binary) :: nil | IdpData.t()
@@ -53,6 +54,12 @@ defmodule Samly.Helper do
     xml_frag = :esaml_sp.generate_authn_request(idp_signin_url, sp, nameid_format)
 
     {idp_signin_url, xml_frag}
+  end
+
+  # Returns the ID attribute of the root element of an AuthnRequest.
+  @spec authn_request_id(tuple) :: String.t()
+  def authn_request_id(xml_frag) do
+    xpath(xml_frag, ~x"./@ID"s)
   end
 
   def gen_idp_signout_req(sp, idp_metadata, subject_rec, session_index) do
