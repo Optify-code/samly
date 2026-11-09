@@ -67,13 +67,36 @@ defmodule Samly.Helper do
     {idp_signout_url, xml_frag}
   end
 
-  def decode_idp_auth_resp(sp, saml_encoding, saml_response) do
+  def decode_idp_auth_resp(sp, saml_encoding, saml_response, idp_id) do
+    duplicate_check_fun = duplicate_check(idp_id)
+
     with {:ok, xml_frag} <- decode_saml_payload(saml_encoding, saml_response),
-         {:ok, assertion_rec} <- :esaml_sp.validate_assertion(xml_frag, sp) do
+         {:ok, assertion_rec} <-
+           :esaml_sp.validate_assertion(xml_frag, duplicate_check_fun, sp) do
       {:ok, Assertion.from_rec(assertion_rec)}
     else
       {:error, reason} -> {:error, reason}
       error -> {:error, {:invalid_request, "#{inspect(error)}"}}
+    end
+  end
+
+  # esaml calls this function after all of its signature and validity checks pass.
+  # A return value other than :ok refuses the assertion as a duplicate.
+  defp duplicate_check(idp_id) do
+    case Application.get_env(:samly, :duplicate_check) do
+      nil ->
+        fn _assertion_rec, _digest -> :ok end
+
+      {mod, fun, args} when is_atom(mod) and is_atom(fun) and is_list(args) ->
+        fn assertion_rec, digest ->
+          assertion = %Assertion{Assertion.from_rec(assertion_rec) | idp_id: idp_id}
+          apply(mod, fun, [assertion, digest | args])
+        end
+
+      other ->
+        raise ArgumentError,
+              "config :samly, :duplicate_check must be {module, function, args}, got: " <>
+                inspect(other)
     end
   end
 

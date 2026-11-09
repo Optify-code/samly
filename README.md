@@ -356,8 +356,24 @@ Take a look at the implementation of `Samly.State.ETS` or `Samly.State.Session` 
 
 +   `Samly` initiated sign-in/sign-out requests send `RelayState` to IdP and expect to get that back. Mismatched or missing `RelayState` in IdP responses to SP initiated requests will fail (with HTTP `403 access_denied`).
 +   Besides the `RelayState`, the request and response `idp_id`s must match. Response is rejected if they don't.
-+   `Samly` makes the original request ID that an auth response corresponds to
-in `Samly.Subject.in_response_to` field. It is the responsibility of the consuming application to use this information along with the validity period in the assertion to check for **replay attacks**. The consuming application should use the `pre_session_create_pipeline` to perform this check. You may need a database or a distributed cache such as memcache in a clustered setup to keep track of these request IDs for their validity period to perform this check. Be aware that `in_response_to` field is **not** set when IDP initialized authorization flow is used.
++   `Samly` can check each assertion for **replay attacks**. Set a duplicate check in the application config:
+
+    ```elixir
+    config :samly, :duplicate_check, {MyApp.SAML, :check_assertion, []}
+    ```
+
+    `Samly` calls `MyApp.SAML.check_assertion(assertion, digest, ...extra args)` for each valid assertion.
+    `assertion` is a `Samly.Assertion` with `idp_id` set.
+    `digest` is the `esaml` SHA-256 digest of the SAML Response.
+    Return `:ok` to accept the assertion.
+    Any other value refuses the response with HTTP `403 access_denied :duplicate`.
+    > The check runs after the `esaml` signature and validity checks.
+    > It runs before the `Samly` `RelayState` and `InResponseTo` checks.
+    > In a cluster, use a shared store, for example a unique index in a database.
+    > An exception in the function propagates to the caller.
+    > With no setting, `Samly` accepts every valid assertion, as before.
+    > The digest changes when an unsigned envelope or the encryption changes.
+    > Thus, key the check on signed assertion fields, such as issuer, subject, `IssueInstant` and `SessionIndex`.
 +   OOTB SAML requests and responses are signed.
 +   Signature digest method supported: `SHA256`.
     > Some Identity Providers may be using `SHA1` by default.
