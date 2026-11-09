@@ -20,4 +20,17 @@ defmodule SamlyAuthHandlerTest do
     request_xml = conn.resp_body |> form_value("SAMLRequest") |> Base.decode64!()
     assert xpath(request_xml, ~x"/*/@ID"s) == request_id
   end
+
+  test "a response to the stored AuthnRequest signs the user in", %{idp: idp} do
+    signin_conn = send_signin(idp)
+    session = get_session(signin_conn)
+    request_id = session["authn_request_id"]
+    relay_state = signin_conn.resp_body |> form_value("RelayState")
+
+    conn = post_consume(response_xml(in_response_to: request_id), session, relay_state)
+
+    assert conn.status == 302
+    assert get_resp_header(conn, "location") == ["/home"]
+    assert get_session(conn, "authn_request_id") == nil
+  end
 end

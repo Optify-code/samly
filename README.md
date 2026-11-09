@@ -374,6 +374,12 @@ Take a look at the implementation of `Samly.State.ETS` or `Samly.State.Session` 
     > With no setting, `Samly` accepts every valid assertion, as before.
     > The digest changes when an unsigned envelope or the encryption changes.
     > Thus, key the check on signed assertion fields, such as issuer, subject, `IssueInstant` and `SessionIndex`.
++   SP-initiated sign-in stores the AuthnRequest ID in the session.
+    `Samly` reads `InResponseTo` from the signed `SubjectConfirmationData` of the assertion.
+    When `InResponseTo` differs from the stored ID, `Samly` refuses the response with HTTP `403 access_denied :invalid_in_response_to`.
+    A matching response deletes the stored ID, so the same session cannot use it again.
+    > A sign-in that started before the upgrade has no stored ID.
+    > `Samly` refuses its response one time, and the user must sign in again.
 +   OOTB SAML requests and responses are signed.
 +   Signature digest method supported: `SHA256`.
     > Some Identity Providers may be using `SHA1` by default.
