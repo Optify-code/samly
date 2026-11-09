@@ -364,20 +364,38 @@ Take a look at the implementation of `Samly.State.ETS` or `Samly.State.Session` 
 
     `Samly` calls `MyApp.SAML.check_assertion(assertion, digest, ...extra args)` for each valid assertion.
     `assertion` is a `Samly.Assertion` with `idp_id` set.
-    `digest` is the `esaml` SHA-256 digest of the SAML Response.
+    `digest` is a SHA-256 digest of the assertion fields that `esaml` decodes.
+    These fields come only from the signed assertion.
+    Thus, a change to an unsigned Response attribute or to the encryption does not change the digest.
     Return `:ok` to accept the assertion.
     Any other value refuses the response with HTTP `403 access_denied :duplicate`.
-    > The check runs after the `esaml` signature and validity checks.
-    > It runs before the `Samly` `RelayState` and `InResponseTo` checks.
-    > In a cluster, use a shared store, for example a unique index in a database.
-    > An exception in the function propagates to the caller.
-    > With no setting, `Samly` accepts every valid assertion, as before.
-    > The digest changes when an unsigned envelope or the encryption changes.
-    > Thus, key the check on signed assertion fields, such as issuer, subject, `IssueInstant` and `SessionIndex`.
+    > The check runs after the `esaml` signature and validity checks and after the `Samly` `RelayState`, `idp_id` and `InResponseTo` checks.
+    > It runs before the `pre_session_create_pipeline`. Thus, a pipeline does not run for a refused replay.
+    > A response that one of these earlier checks refuses does not reach the check, so a later retry is not refused as a duplicate.
+    > In a cluster, use a shared store with an atomic claim, for example a unique index in a database.
+    > An exception in the function propagates to the caller, and the request fails with HTTP 500.
+    > With no setting, `Samly` does not check for replayed assertions. The single-use request ID below still applies.
+
+    Set a release function to remove a claim when `Samly` does not accept the assertion:
+
+    ```elixir
+    config :samly, :duplicate_release, {MyApp.SAML, :release_assertion, []}
+    ```
+
+    `Samly` calls `MyApp.SAML.release_assertion(assertion, digest, ...extra args)` when the `pre_session_create_pipeline` halts or raises, or when the state store raises.
+    Then no session exists, and a retry of the same response can sign in.
+    `Samly` ignores the return value.
+    > Without a release function, the claim stays. A retry of the same response is then refused as a duplicate.
 +   SP-initiated sign-in stores the AuthnRequest ID in the session.
     `Samly` reads `InResponseTo` from the signed `SubjectConfirmationData` of the assertion.
     When `InResponseTo` differs from the stored ID, `Samly` refuses the response with HTTP `403 access_denied :invalid_in_response_to`.
-    A matching response deletes the stored ID, so the same session cannot use it again.
+    Each request ID signs in one time only:
+    +   An accepted SP-initiated response claims its request ID in an ETS table on the node. The claim is atomic.
+    +   A second response to the same request ID gets HTTP `403 access_denied :invalid_in_response_to`. This applies to two requests at the same time and to an old session cookie.
+    +   An accepted SP-initiated response also deletes the stored ID from the session. An IdP-initiated response does not delete it.
+    +   When the `pre_session_create_pipeline` halts or raises, or the state store raises, `Samly` releases the claim.
+    > The ETS table is local to each node. In a cluster, a response can go to a different node.
+    > To make each response single use across the cluster, set the duplicate check above. Claim the digest or `subject.in_response_to` in a shared store.
     > A sign-in that started before the upgrade has no stored ID.
     > `Samly` refuses its response one time, and the user must sign in again.
 +   OOTB SAML requests and responses are signed.

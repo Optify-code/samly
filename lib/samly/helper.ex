@@ -3,7 +3,7 @@ defmodule Samly.Helper do
 
   require Samly.Esaml
   import SweetXml, only: [sigil_x: 2, xpath: 2]
-  alias Samly.{Assertion, Esaml, IdpData}
+  alias Samly.{Assertion, Esaml, IdpData, UsedRequestIds}
 
   @spec get_idp(binary) :: nil | IdpData.t()
   def get_idp(idp_id) do
@@ -74,35 +74,154 @@ defmodule Samly.Helper do
     {idp_signout_url, xml_frag}
   end
 
-  def decode_idp_auth_resp(sp, saml_encoding, saml_response, idp_id) do
-    duplicate_check_fun = duplicate_check(idp_id)
-
+  def decode_idp_auth_resp(sp, saml_encoding, saml_response) do
     with {:ok, xml_frag} <- decode_saml_payload(saml_encoding, saml_response),
-         {:ok, assertion_rec} <-
-           :esaml_sp.validate_assertion(xml_frag, duplicate_check_fun, sp) do
-      {:ok, Assertion.from_rec(assertion_rec)}
+         {:ok, assertion_rec} <- :esaml_sp.validate_assertion(xml_frag, sp) do
+      assertion = Assertion.from_rec(assertion_rec)
+      {:ok, assertion, assertion_digest(assertion)}
     else
       {:error, reason} -> {:error, reason}
       error -> {:error, {:invalid_request, "#{inspect(error)}"}}
     end
   end
 
-  # esaml calls this function after all of its signature and validity checks pass.
-  # A return value other than :ok refuses the assertion as a duplicate.
-  defp duplicate_check(idp_id) do
-    case Application.get_env(:samly, :duplicate_check) do
-      nil ->
-        fn _assertion_rec, _digest -> :ok end
+  # SHA-256 over the assertion fields that esaml decoded.
+  # These fields come only from the assertion, which the IdP signs.
+  # Thus, a change to an unsigned Response attribute or to the encryption
+  # does not change the digest.
+  @spec assertion_digest(Assertion.t()) :: binary
+  def assertion_digest(%Assertion{} = assertion) do
+    fields = %Assertion{assertion | computed: %{}, idp_id: ""}
+    :crypto.hash(:sha256, canonical(fields))
+  end
 
-      {mod, fun, args} when is_atom(mod) and is_atom(fun) and is_list(args) ->
-        fn assertion_rec, digest ->
-          assertion = %Assertion{Assertion.from_rec(assertion_rec) | idp_id: idp_id}
-          apply(mod, fun, [assertion, digest | args])
+  defp canonical(value) when is_binary(value),
+    do: ["s", Integer.to_string(byte_size(value)), ":", value]
+
+  defp canonical(value) when is_atom(value), do: ["a", canonical(Atom.to_string(value))]
+
+  defp canonical(value) when is_list(value),
+    do: ["l", Integer.to_string(length(value)), ":", Enum.map(value, &canonical/1)]
+
+  defp canonical(%_{} = value), do: value |> Map.from_struct() |> canonical()
+
+  defp canonical(%{} = value) do
+    pairs =
+      value
+      |> Enum.map(fn {k, v} -> {to_string(k), v} end)
+      |> Enum.sort()
+      |> Enum.map(fn {k, v} -> [canonical(k), canonical(v)] end)
+
+    ["m", Integer.to_string(map_size(value)), ":", pairs]
+  end
+
+  @doc false
+  # Claims the assertion before samly runs the pre-session pipeline:
+  #   1. An SP-initiated response claims its InResponseTo on this node.
+  #   2. The function in `config :samly, :duplicate_check` claims the assertion.
+  # A refused or failed claim releases the claims that it made before.
+  # release_assertion/2 releases both claims when samly does not accept the assertion.
+  @spec claim_assertion(Assertion.t(), binary) ::
+          :ok | {:error, :invalid_in_response_to | :duplicate}
+  def claim_assertion(%Assertion{} = assertion, digest) do
+    with :ok <- claim_request_id(assertion) do
+      try do
+        check_duplicate(assertion, digest)
+      catch
+        kind, reason ->
+          release_request_id(assertion)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      else
+        :ok ->
+          :ok
+
+        error ->
+          release_request_id(assertion)
+          error
+      end
+    end
+  end
+
+  @doc false
+  # Releases the claims of claim_assertion/2. samly calls it when the
+  # pre-session pipeline halts or raises, or when the state store raises.
+  # Then the same response can sign in on a retry.
+  @spec release_assertion(Assertion.t(), binary) :: :ok
+  def release_assertion(%Assertion{} = assertion, digest) do
+    release_request_id(assertion)
+
+    if Application.get_env(:samly, :duplicate_check) != nil do
+      case callback(:duplicate_release) do
+        nil -> :ok
+        {mod, fun, args} -> apply(mod, fun, [assertion, digest | args])
+      end
+    end
+
+    :ok
+  end
+
+  defp claim_request_id(%Assertion{subject: %{in_response_to: ""}}), do: :ok
+
+  defp claim_request_id(%Assertion{idp_id: idp_id, subject: subject} = assertion) do
+    UsedRequestIds.claim(idp_id, subject.in_response_to, stale_time(assertion))
+  end
+
+  defp release_request_id(%Assertion{subject: %{in_response_to: ""}}), do: :ok
+
+  defp release_request_id(%Assertion{idp_id: idp_id, subject: subject}) do
+    UsedRequestIds.release(idp_id, subject.in_response_to)
+  end
+
+  # The Unix time after which esaml refuses the assertion as stale.
+  # It uses the same rule as esaml:stale_time/1.
+  defp stale_time(%Assertion{} = assertion) do
+    limits =
+      [assertion.subject.notonorafter, assertion.conditions["not_on_or_after"]]
+      |> Enum.map(&unix_time/1)
+      |> Enum.reject(&is_nil/1)
+
+    case limits do
+      [] -> (unix_time(assertion.issue_instant) || System.os_time(:second)) + 5 * 60
+      _ -> Enum.min(limits)
+    end
+  end
+
+  defp unix_time(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _} -> DateTime.to_unix(datetime)
+      _ -> nil
+    end
+  end
+
+  defp unix_time(_), do: nil
+
+  # Calls the function in `config :samly, :duplicate_check`.
+  # A return value other than :ok refuses the assertion.
+  @spec check_duplicate(Assertion.t(), binary) :: :ok | {:error, :duplicate}
+  def check_duplicate(%Assertion{} = assertion, digest) do
+    case callback(:duplicate_check) do
+      nil ->
+        :ok
+
+      {mod, fun, args} ->
+        case apply(mod, fun, [assertion, digest | args]) do
+          :ok -> :ok
+          _ -> {:error, :duplicate}
         end
+    end
+  end
+
+  defp callback(key) do
+    case Application.get_env(:samly, key) do
+      nil ->
+        nil
+
+      {mod, fun, args} = mfa when is_atom(mod) and is_atom(fun) and is_list(args) ->
+        mfa
 
       other ->
         raise ArgumentError,
-              "config :samly, :duplicate_check must be {module, function, args}, got: " <>
+              "config :samly, #{inspect(key)} must be {module, function, args}, got: " <>
                 inspect(other)
     end
   end

@@ -34,20 +34,12 @@ defmodule Samly.SPHandler do
     saml_response = conn.body_params["SAMLResponse"]
     relay_state = conn.body_params["RelayState"] |> safe_decode_www_form()
 
-    with {:ok, assertion} <-
-           Helper.decode_idp_auth_resp(sp, saml_encoding, saml_response, idp_id),
+    with {:ok, assertion, digest} <-
+           Helper.decode_idp_auth_resp(sp, saml_encoding, saml_response),
          :ok <- validate_authresp(conn, assertion, relay_state),
-         conn = delete_session(conn, "authn_request_id"),
          assertion = %Assertion{assertion | idp_id: idp_id},
-         conn = conn |> put_private(:samly_assertion, assertion),
-         {:halted, %Conn{halted: false} = conn} <- {:halted, pipethrough(conn, pipeline)} do
-      updated_assertion = conn.private[:samly_assertion]
-      computed = updated_assertion.computed
-      assertion = %Assertion{assertion | computed: computed, idp_id: idp_id}
-
-      nameid = assertion.subject.name
-      assertion_key = {idp_id, nameid}
-      conn = State.put_assertion(conn, assertion_key, assertion)
+         :ok <- Helper.claim_assertion(assertion, digest),
+         {:ok, conn, assertion_key} <- accept_or_release(conn, assertion, digest, pipeline) do
       target_url = auth_target_url(conn, assertion, relay_state)
 
       conn
@@ -64,6 +56,36 @@ defmodule Samly.SPHandler do
     #   error ->
     #     Logger.error("#{inspect error}")
     #     conn |> send_resp(500, "request_failed")
+  end
+
+  # Runs the pre-session pipeline and stores the assertion.
+  # When the pipeline halts or raises, or the state store raises, no session
+  # exists. Then samly releases the claims, so a retry is not refused as a
+  # duplicate.
+  defp accept_or_release(conn, assertion, digest, pipeline) do
+    %Assertion{idp_id: idp_id} = assertion
+
+    try do
+      conn =
+        conn
+        |> consume_authn_request_id(assertion)
+        |> put_private(:samly_assertion, assertion)
+        |> pipethrough(pipeline)
+
+      if conn.halted do
+        Helper.release_assertion(assertion, digest)
+        {:halted, conn}
+      else
+        computed = conn.private[:samly_assertion].computed
+        assertion = %Assertion{assertion | computed: computed, idp_id: idp_id}
+        assertion_key = {idp_id, assertion.subject.name}
+        {:ok, State.put_assertion(conn, assertion_key, assertion), assertion_key}
+      end
+    catch
+      kind, reason ->
+        Helper.release_assertion(assertion, digest)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
   end
 
   # IDP-initiated flow auth response
@@ -111,6 +133,13 @@ defmodule Samly.SPHandler do
         :ok
     end
   end
+
+  # Only an SP-initiated response uses the stored AuthnRequest ID.
+  # An IdP-initiated response keeps the ID of a pending SP-initiated sign-in.
+  defp consume_authn_request_id(conn, %{subject: %{in_response_to: ""}}), do: conn
+
+  defp consume_authn_request_id(conn, _assertion),
+    do: delete_session(conn, "authn_request_id")
 
   defp pipethrough(conn, nil), do: conn
 

@@ -57,6 +57,7 @@ defmodule Samly.Provider do
 
     Application.put_env(:samly, :idp_id_from, idp_id_from)
     :esaml_util.start_ets()
+    Samly.UsedRequestIds.init()
 
     refresh_providers()
   end

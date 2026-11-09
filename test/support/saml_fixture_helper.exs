@@ -54,7 +54,8 @@ defmodule Samly.TestSAML do
           :identity_providers,
           :idp_id_from,
           :state_store,
-          :duplicate_check
+          :duplicate_check,
+          :duplicate_release
         ] do
       Application.delete_env(:samly, key)
     end
@@ -132,6 +133,40 @@ defmodule Samly.TestSAML do
   def doctype_xml do
     ~s(<!DOCTYPE samlp:Response [<!ENTITY x "y">]>) <>
       ~s(<samlp:Response xmlns:samlp="#{@protocol_ns}">&x;</samlp:Response>)
+  end
+
+  @slo_uri "http://samly.howto:4003/sso/sp/logout/idp1"
+
+  # A LogoutResponse from the IdP. With doctype: true, it has a DOCTYPE.
+  def logout_response_xml(opts \\ []) do
+    doctype(:LogoutResponse, opts) <>
+      ~s(<samlp:LogoutResponse xmlns:samlp="#{@protocol_ns}" xmlns:saml="#{@assertion_ns}" ) <>
+      ~s(ID="_lr1" Version="2.0" IssueInstant="#{iso(DateTime.utc_now())}" ) <>
+      ~s(Destination="#{@slo_uri}" InResponseTo="_lq0">) <>
+      ~s(<saml:Issuer>#{@issuer}</saml:Issuer>) <>
+      ~s(<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>) <>
+      ~s(</samlp:Status></samlp:LogoutResponse>)
+  end
+
+  # A LogoutRequest that test/data/test.pem signs as the IdP.
+  # With doctype: true, it has a DOCTYPE.
+  def logout_request_xml(opts \\ []) do
+    request =
+      ~s(<samlp:LogoutRequest xmlns:samlp="#{@protocol_ns}" xmlns:saml="#{@assertion_ns}" ) <>
+        ~s(ID="_lq1" Version="2.0" IssueInstant="#{iso(DateTime.utc_now())}" ) <>
+        ~s(Destination="#{@slo_uri}">) <>
+        ~s(<saml:Issuer>#{@issuer}</saml:Issuer>) <>
+        ~s(<saml:NameID>user@example.com</saml:NameID>) <>
+        ~s(<samlp:SessionIndex>_s1</samlp:SessionIndex>) <>
+        ~s(</samlp:LogoutRequest>)
+
+    doctype(:LogoutRequest, opts) <> sign(request)
+  end
+
+  defp doctype(root, opts) do
+    if Keyword.get(opts, :doctype, false),
+      do: ~s(<!DOCTYPE samlp:#{root} [<!ENTITY x "y">]>),
+      else: ""
   end
 
   # Posts a SAMLResponse or a SAMLRequest to the sign-out route.

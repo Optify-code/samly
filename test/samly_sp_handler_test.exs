@@ -11,6 +11,52 @@ defmodule SamlySPHandlerTest do
     end
   end
 
+  # A shared store with an atomic claim, as the README advises.
+  defmodule Claim do
+    def check(_assertion, digest, table) do
+      if :ets.insert_new(table, {digest}), do: :ok, else: {:error, :claimed}
+    end
+
+    def release(_assertion, digest, table) do
+      :ets.delete(table, digest)
+    end
+  end
+
+  defp claim_check do
+    table = :ets.new(:claims, [:set, :public])
+    Application.put_env(:samly, :duplicate_check, {Claim, :check, [table]})
+    Application.put_env(:samly, :duplicate_release, {Claim, :release, [table]})
+  end
+
+  # Another node has its own table of used request IDs.
+  defp on_other_node do
+    :ets.delete_all_objects(:samly_used_request_ids)
+  end
+
+  # A pre-session pipeline that halts while the process has :halt_pipeline set.
+  defmodule HaltPipeline do
+    def call(conn, _opts) do
+      if Process.get(:halt_pipeline),
+        do: conn |> Plug.Conn.send_resp(403, "pipeline_refused") |> Plug.Conn.halt(),
+        else: conn
+    end
+  end
+
+  # A state store that raises while the process has :fail_store set.
+  defmodule FailingStore do
+    @behaviour Samly.State.Store
+    def init(opts), do: Samly.State.Session.init(opts)
+    def get_assertion(conn, key, opts), do: Samly.State.Session.get_assertion(conn, key, opts)
+
+    def put_assertion(conn, key, assertion, opts) do
+      if Process.get(:fail_store), do: raise("store down")
+      Samly.State.Session.put_assertion(conn, key, assertion, opts)
+    end
+
+    def delete_assertion(conn, key, opts),
+      do: Samly.State.Session.delete_assertion(conn, key, opts)
+  end
+
   @unsigned %{signed_assertion_in_resp: false, signed_envelopes_in_resp: false}
 
   setup do
@@ -33,8 +79,9 @@ defmodule SamlySPHandlerTest do
 
     test "passes the assertion with its IdP id and the digest to the duplicate check" do
       Application.put_env(:samly, :duplicate_check, {DupCheck, :check, [self(), :ok]})
+      xml = response_xml(in_response_to: "req-1")
 
-      conn = post_consume(response_xml(in_response_to: "req-1"))
+      conn = post_consume(xml)
 
       assert conn.status == 302
 
@@ -42,32 +89,121 @@ defmodule SamlySPHandlerTest do
                        %Samly.Assertion{
                          idp_id: "idp1",
                          issuer: "urn:test:idp",
-                         subject: %{name: "user@example.com"}
-                       }, digest}
+                         subject: %{name: "user@example.com", in_response_to: "req-1"}
+                       } = assertion, digest}
 
-      assert is_binary(digest) and byte_size(digest) == 32
+      assert byte_size(digest) == 32
+      assert digest == Samly.Helper.assertion_digest(assertion)
+      assert digest == digest_of(xml)
+
+      refute digest ==
+               digest_of(response_xml(in_response_to: "req-1", name_id: "other@example.com"))
     end
 
-    test "refuses the response when the duplicate check does not return :ok" do
-      Application.put_env(
-        :samly,
-        :duplicate_check,
-        {DupCheck, :check, [self(), {:error, :replayed}]}
-      )
+    test "gives the same digest when an unsigned Response attribute changes", %{idp: idp} do
+      xml = response_xml(in_response_to: "req-1")
+      changed = String.replace(xml, ~s(ID="_r1"), ~s(ID="_r2"))
+      assert changed != xml
 
-      conn = post_consume(response_xml(in_response_to: "req-1"))
+      assert digest_of(changed, idp) == digest_of(xml, idp)
+    end
+
+    test "refuses a replayed response with a changed unsigned Response attribute" do
+      claim_check()
+      xml = response_xml(in_response_to: "req-1")
+
+      assert post_consume(xml).status == 302
+
+      on_other_node()
+      conn = post_consume(String.replace(xml, ~s(ID="_r1"), ~s(ID="_r2")))
 
       assert conn.status == 403
       assert conn.resp_body == "access_denied :duplicate"
-      assert get_session(conn, "samly_assertion_key") == nil
     end
 
-    test "raises on an invalid duplicate check setting", %{idp: idp} do
-      Application.put_env(:samly, :duplicate_check, :bad)
+    test "refuses the response when the duplicate check does not return :ok" do
+      for result <- [{:error, :replayed}, :error, false, nil, "ok", {:ok, :claimed}] do
+        Application.put_env(:samly, :duplicate_check, {DupCheck, :check, [self(), result]})
+
+        conn = post_consume(response_xml(in_response_to: "req-1"))
+
+        assert_received {:duplicate_check, _, _}
+        assert conn.status == 403, "accepted #{inspect(result)}"
+        assert conn.resp_body == "access_denied :duplicate"
+        assert get_session(conn, "samly_assertion_key") == nil
+        assert get_session(conn, "authn_request_id") == "req-1"
+      end
+    end
+
+    test "does not call the duplicate check for a response that samly refuses" do
+      Application.put_env(:samly, :duplicate_check, {DupCheck, :check, [self(), :ok]})
       xml = response_xml(in_response_to: "req-1")
 
+      conn = post_consume(xml, default_session(), "wrong-relay-state")
+
+      assert conn.status == 403
+      assert conn.resp_body == "access_denied :invalid_relay_state"
+      refute_received {:duplicate_check, _, _}
+
+      claim_check()
+      assert post_consume(xml, default_session(), "wrong-relay-state").status == 403
+      assert post_consume(xml).status == 302
+    end
+
+    test "refuses a replayed response that the duplicate check claimed" do
+      claim_check()
+      xml = response_xml(in_response_to: "req-1")
+
+      assert post_consume(xml).status == 302
+
+      on_other_node()
+      conn = post_consume(xml)
+
+      assert conn.status == 403
+      assert conn.resp_body == "access_denied :duplicate"
+    end
+
+    test "accepts a retry of a response after the pre-session pipeline halts" do
+      claim_check()
+      setup_provider(Map.put(@unsigned, :pre_session_create_pipeline, HaltPipeline))
+      xml = response_xml(in_response_to: "req-1")
+
+      Process.put(:halt_pipeline, true)
+      halted = post_consume(xml)
+
+      assert halted.status == 403
+      assert halted.resp_body == "pipeline_refused"
+
+      Process.delete(:halt_pipeline)
+      conn = post_consume(xml)
+
+      assert conn.status == 302
+      assert get_resp_header(conn, "location") == ["/home"]
+    end
+
+    test "accepts a retry of a response after the state store fails" do
+      claim_check()
+      Samly.State.init(FailingStore)
+      xml = response_xml(in_response_to: "req-1")
+
+      Process.put(:fail_store, true)
+
+      error = assert_raise Plug.Conn.WrapperError, fn -> post_consume(xml) end
+      assert %RuntimeError{message: "store down"} = error.reason
+
+      Process.delete(:fail_store)
+      conn = post_consume(xml)
+
+      assert conn.status == 302
+      assert get_session(conn, "samly_assertion_key") == {"idp1", "user@example.com"}
+    end
+
+    test "raises on an invalid duplicate check setting" do
+      Application.put_env(:samly, :duplicate_check, :bad)
+      assertion = %Samly.Assertion{idp_id: "idp1"}
+
       assert_raise ArgumentError, ~r/:duplicate_check/, fn ->
-        Samly.Helper.decode_idp_auth_resp(idp.esaml_sp_rec, nil, Base.encode64(xml), "idp1")
+        Samly.Helper.check_duplicate(assertion, <<0::256>>)
       end
     end
   end
@@ -105,6 +241,42 @@ defmodule SamlySPHandlerTest do
 
       assert conn.status == 302
       assert get_session(conn, "authn_request_id") == nil
+    end
+
+    test "refuses a response posted again with the original session" do
+      xml = response_xml(in_response_to: "req-1")
+
+      assert post_consume(xml).status == 302
+
+      # The original session still holds the ID, as an old session cookie does.
+      replay = post_consume(xml, default_session())
+
+      assert replay.status == 403
+      assert replay.resp_body == "access_denied :invalid_in_response_to"
+    end
+
+    test "accepts only one of two concurrent responses to the same request ID" do
+      xml = response_xml(in_response_to: "req-1")
+
+      results =
+        1..2
+        |> Enum.map(fn _ ->
+          Task.async(fn ->
+            conn = post_consume(xml)
+            {conn.status, conn.resp_body}
+          end)
+        end)
+        |> Enum.map(&Task.await/1)
+        |> Enum.sort()
+
+      assert [{302, _}, {403, "access_denied :invalid_in_response_to"}] = results
+    end
+
+    test "accepts a new request ID after a request ID is used" do
+      assert post_consume(response_xml(in_response_to: "req-1")).status == 302
+
+      session = Map.put(default_session(), "authn_request_id", "req-2")
+      assert post_consume(response_xml(in_response_to: "req-2"), session).status == 302
     end
 
     test "refuses the same response posted again in the same session" do
@@ -158,6 +330,20 @@ defmodule SamlySPHandlerTest do
       assert conn.status == 302
       assert get_resp_header(conn, "location") == ["/landing"]
     end
+
+    test "keeps the stored request ID after an IdP-initiated response" do
+      setup_provider(Map.put(@unsigned, :allow_idp_initiated_flow, true))
+
+      conn = post_consume(response_xml(in_response_to: nil), default_session(), "/landing")
+
+      assert conn.status == 302
+      assert get_session(conn, "authn_request_id") == "req-1"
+
+      pending = post_consume(response_xml(in_response_to: "req-1"), get_session(conn))
+
+      assert pending.status == 302
+      assert get_resp_header(pending, "location") == ["/home"]
+    end
   end
 
   describe "esaml refusals" do
@@ -166,16 +352,25 @@ defmodule SamlySPHandlerTest do
     end
 
     test "answers 403 for a LogoutResponse with a DOCTYPE" do
-      conn = post_logout("SAMLResponse", doctype_xml())
+      # Without the DOCTYPE, samly accepts the same LogoutResponse.
+      assert post_logout("SAMLResponse", logout_response_xml()).status == 302
+
+      conn = post_logout("SAMLResponse", logout_response_xml(doctype: true))
 
       assert conn.status == 403
       assert String.starts_with?(conn.resp_body, "invalid_request")
     end
 
     test "answers a denied LogoutResponse for a LogoutRequest with a DOCTYPE" do
+      # Without the DOCTYPE, samly decodes and validates the same signed LogoutRequest.
+      # It logs no error. It denies the request only because no user is signed in.
+      assert ExUnit.CaptureLog.capture_log(fn ->
+               assert post_logout("SAMLRequest", logout_request_xml()).status == 200
+             end) == ""
+
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          conn = post_logout("SAMLRequest", doctype_xml())
+          conn = post_logout("SAMLRequest", logout_request_xml(doctype: true))
           send(self(), {:conn, conn})
         end)
 
@@ -196,5 +391,12 @@ defmodule SamlySPHandlerTest do
       assert conn.status == 403
       assert String.starts_with?(conn.resp_body, "access_denied")
     end
+  end
+
+  defp digest_of(xml, idp \\ Samly.Helper.get_idp("idp1")) do
+    {:ok, _assertion, digest} =
+      Samly.Helper.decode_idp_auth_resp(idp.esaml_sp_rec, nil, Base.encode64(xml))
+
+    digest
   end
 end

@@ -1,8 +1,9 @@
 # CHANGELOG
 
 ### v1.4.0-optify.1
-+   Add the `config :samly, :duplicate_check` setting. `Samly` calls the configured function for each valid assertion and refuses a replayed assertion with HTTP 403. With no setting, `Samly` accepts every valid assertion, as before.
-+   SP-initiated sign-in stores the AuthnRequest ID in the session. `Samly` refuses a response whose signed `InResponseTo` differs (`access_denied :invalid_in_response_to`). A matching response deletes the stored ID.
++   Add the `config :samly, :duplicate_check` setting. `Samly` calls the configured function after its own checks pass and before the `pre_session_create_pipeline`. It refuses a replayed assertion with HTTP 403. The digest covers only the signed assertion fields. With no setting, `Samly` does not check for replayed assertions.
++   Add the `config :samly, :duplicate_release` setting. `Samly` calls it to release a claim when the `pre_session_create_pipeline` halts or raises, or when the state store raises.
++   SP-initiated sign-in stores the AuthnRequest ID in the session. `Samly` refuses a response whose signed `InResponseTo` differs (`access_denied :invalid_in_response_to`). An accepted SP-initiated response claims its request ID atomically in an ETS table on the node, so a second response to the same ID is refused. It also deletes the stored ID from the session. An IdP-initiated response does not delete it.
     > A sign-in that started before the upgrade has no stored ID. `Samly` refuses its response one time, and the user must sign in again.
 +   Add a test: an unsolicited response stays refused while `allow_idp_initiated_flow` is off.
 +   Depend on the Optify `esaml` fork at `v4.6.0-optify.1`. The fork refuses unsafe payloads, for example a payload with a DOCTYPE.
