@@ -140,8 +140,12 @@ defmodule Samly.Helper do
 
   defp decode_saml_payload(saml_encoding, saml_payload) do
     try do
-      xml = :esaml_binding.decode_response(saml_encoding, saml_payload)
-      {:ok, xml}
+      # The esaml fork returns {:error, reason} for a payload that it refuses,
+      # for example a payload with a DOCTYPE.
+      case :esaml_binding.decode_response(saml_encoding, saml_payload) do
+        {:error, reason} -> {:error, {:invalid_response, reason}}
+        xml -> {:ok, xml}
+      end
     rescue
       error -> {:error, {:invalid_response, "#{inspect(error)}"}}
     end

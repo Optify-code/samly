@@ -128,6 +128,19 @@ defmodule Samly.TestSAML do
     |> Samly.Router.call(Samly.Router.init([]))
   end
 
+  # The esaml fork refuses this payload with {error, doctype_not_allowed}.
+  def doctype_xml do
+    ~s(<!DOCTYPE samlp:Response [<!ENTITY x "y">]>) <>
+      ~s(<samlp:Response xmlns:samlp="#{@protocol_ns}">&x;</samlp:Response>)
+  end
+
+  # Posts a SAMLResponse or a SAMLRequest to the sign-out route.
+  def post_logout(param, xml) do
+    conn(:post, "/sp/logout/idp1", %{param => Base.encode64(xml), "RelayState" => "rs1"})
+    |> init_test_session(%{"relay_state" => "rs1", "idp_id" => "idp1", "target_url" => "/"})
+    |> Samly.Router.call(Samly.Router.init([]))
+  end
+
   # Calls Samly.AuthHandler.send_signin_req/1 directly. This skips the CSRF check.
   def send_signin(idp) do
     conn(:post, "/auth/signin/idp1")

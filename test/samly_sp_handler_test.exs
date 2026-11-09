@@ -159,4 +159,42 @@ defmodule SamlySPHandlerTest do
       assert get_resp_header(conn, "location") == ["/landing"]
     end
   end
+
+  describe "esaml refusals" do
+    setup do
+      %{idp: setup_provider(@unsigned)}
+    end
+
+    test "answers 403 for a LogoutResponse with a DOCTYPE" do
+      conn = post_logout("SAMLResponse", doctype_xml())
+
+      assert conn.status == 403
+      assert String.starts_with?(conn.resp_body, "invalid_request")
+    end
+
+    test "answers a denied LogoutResponse for a LogoutRequest with a DOCTYPE" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          conn = post_logout("SAMLRequest", doctype_xml())
+          send(self(), {:conn, conn})
+        end)
+
+      assert_received {:conn, conn}
+      assert log =~ "invalid_request"
+      assert conn.status == 200
+      assert [content_type] = get_resp_header(conn, "content-type")
+      assert content_type =~ "text/html"
+
+      logout_response = conn.resp_body |> form_value("SAMLResponse") |> Base.decode64!()
+      assert logout_response =~ "LogoutResponse"
+      assert logout_response =~ "urn:oasis:names:tc:SAML:2.0:status:RequestDenied"
+    end
+
+    test "answers 403 for a SAMLResponse with a DOCTYPE" do
+      conn = post_consume(doctype_xml())
+
+      assert conn.status == 403
+      assert String.starts_with?(conn.resp_body, "access_denied")
+    end
+  end
 end
