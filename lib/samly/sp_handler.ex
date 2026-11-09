@@ -9,6 +9,8 @@ defmodule Samly.SPHandler do
 
   import Samly.RouterUtil, only: [ensure_sp_uris_set: 2, send_saml_request: 5, redirect: 3]
 
+  @restart_key "samly_restarted_idp"
+
   def send_metadata(conn) do
     %IdpData{} = idp = conn.private[:samly_idp]
     %IdpData{esaml_idp_rec: _idp_rec, esaml_sp_rec: sp_rec} = idp
@@ -40,7 +42,7 @@ defmodule Samly.SPHandler do
          assertion = %Assertion{assertion | idp_id: idp_id},
          :ok <- Helper.claim_assertion(assertion, digest),
          {:ok, conn, assertion_key} <- accept_or_release(conn, assertion, digest, pipeline) do
-      target_url = auth_target_url(conn, assertion, relay_state)
+      target_url = auth_target_url(conn)
 
       conn
       |> configure_session(renew: true)
@@ -48,6 +50,7 @@ defmodule Samly.SPHandler do
       |> redirect(302, target_url)
     else
       {:halted, conn} -> conn
+      {:restart, target_url} -> restart_signin(conn, idp_id, target_url)
       {:error, reason} -> conn |> send_resp(403, "access_denied #{inspect(reason)}")
       _ -> conn |> send_resp(403, "access_denied")
     end
@@ -56,6 +59,35 @@ defmodule Samly.SPHandler do
     #   error ->
     #     Logger.error("#{inspect error}")
     #     conn |> send_resp(500, "request_failed")
+  end
+
+  # An unsolicited response never signs in. Anyone can post their own valid
+  # assertion to another user's browser. The browser starts an SP-initiated
+  # sign-in at the same IdP instead. The IdP answers for the user that holds
+  # the IdP session, so a user from the IdP portal signs in after one more
+  # redirect. A second unsolicited response in a row is refused, so an IdP
+  # that never sets InResponseTo cannot cause a redirect loop.
+  defp restart_signin(conn, idp_id, target_url) do
+    if get_session(conn, @restart_key) == idp_id do
+      conn
+      |> delete_session(@restart_key)
+      |> send_resp(403, "access_denied #{inspect(:unsolicited_response)}")
+    else
+      query = URI.encode_query(%{"target_url" => URI.encode_www_form(target_url)})
+
+      conn
+      |> put_session(@restart_key, idp_id)
+      |> redirect(302, signin_path(conn, idp_id) <> "?" <> query)
+    end
+  end
+
+  # The SP router is mounted at "<prefix>/sp" and the auth router at "<prefix>/auth".
+  defp signin_path(conn, idp_id) do
+    prefix = conn.script_name |> Enum.drop(-1) |> Enum.map(&("/" <> &1)) |> Enum.join()
+
+    if Application.get_env(:samly, :idp_id_from) == :subdomain,
+      do: prefix <> "/auth/signin",
+      else: prefix <> "/auth/signin/" <> URI.encode(idp_id, &URI.char_unreserved?/1)
   end
 
   # Runs the pre-session pipeline and stores the assertion.
@@ -89,22 +121,28 @@ defmodule Samly.SPHandler do
   end
 
   # IDP-initiated flow auth response
-  @spec validate_authresp(Conn.t(), Assertion.t(), binary) :: :ok | {:error, atom}
+  @spec validate_authresp(Conn.t(), Assertion.t(), binary) ::
+          :ok | {:restart, binary} | {:error, atom}
   defp validate_authresp(conn, %{subject: %{in_response_to: ""}}, relay_state) do
     idp_data = conn.private[:samly_idp]
 
-    if idp_data.allow_idp_initiated_flow do
-      if idp_data.allowed_target_urls do
-        if relay_state in idp_data.allowed_target_urls do
-          :ok
-        else
-          {:error, :invalid_target_url}
-        end
-      else
-        :ok
-      end
-    else
-      {:error, :idp_first_flow_not_allowed}
+    cond do
+      not idp_data.allow_idp_initiated_flow ->
+        {:error, :idp_first_flow_not_allowed}
+
+      relay_state in [nil, ""] ->
+        {:restart, "/"}
+
+      is_list(idp_data.allowed_target_urls) ->
+        if relay_state in idp_data.allowed_target_urls,
+          do: {:restart, relay_state},
+          else: {:error, :invalid_target_url}
+
+      local_path?(relay_state) ->
+        {:restart, relay_state}
+
+      true ->
+        {:restart, "/"}
     end
   end
 
@@ -134,12 +172,21 @@ defmodule Samly.SPHandler do
     end
   end
 
-  # Only an SP-initiated response uses the stored AuthnRequest ID.
-  # An IdP-initiated response keeps the ID of a pending SP-initiated sign-in.
-  defp consume_authn_request_id(conn, %{subject: %{in_response_to: ""}}), do: conn
+  # RelayState is not signed. Without an allowed_target_urls list, only a path
+  # on this site is kept.
+  defp local_path?("/" <> rest) do
+    not String.starts_with?(rest, ["/", "\\"]) and
+      not String.contains?(rest, ["\\", "\r", "\n", "\t"]) and
+      match?(%URI{scheme: nil, host: nil}, URI.parse("/" <> rest))
+  end
 
-  defp consume_authn_request_id(conn, _assertion),
-    do: delete_session(conn, "authn_request_id")
+  defp local_path?(_target), do: false
+
+  defp consume_authn_request_id(conn, _assertion) do
+    conn
+    |> delete_session("authn_request_id")
+    |> delete_session(@restart_key)
+  end
 
   defp pipethrough(conn, nil), do: conn
 
@@ -147,10 +194,7 @@ defmodule Samly.SPHandler do
     pipeline.call(conn, [])
   end
 
-  defp auth_target_url(_conn, %{subject: %{in_response_to: ""}}, ""), do: "/"
-  defp auth_target_url(_conn, %{subject: %{in_response_to: ""}}, url), do: url
-
-  defp auth_target_url(conn, _assertion, _relay_state) do
+  defp auth_target_url(conn) do
     get_session(conn, "target_url") || "/"
   end
 

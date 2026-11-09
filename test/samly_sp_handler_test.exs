@@ -322,27 +322,92 @@ defmodule SamlySPHandlerTest do
       assert get_session(conn, "samly_assertion_key") == nil
     end
 
-    test "accepts a response without InResponseTo when IdP-initiated sign-in is on" do
+    test "restarts an SP-initiated sign-in for a response without InResponseTo" do
       setup_provider(Map.put(@unsigned, :allow_idp_initiated_flow, true))
 
       conn = post_consume(response_xml(in_response_to: nil), default_session(), "/landing")
 
       assert conn.status == 302
-      assert get_resp_header(conn, "location") == ["/landing"]
+
+      assert get_resp_header(conn, "location") == [
+               "/auth/signin/idp1?target_url=%252Flanding"
+             ]
+
+      assert get_session(conn, "samly_assertion_key") == nil
+      assert get_session(conn, "samly_restarted_idp") == "idp1"
     end
 
-    test "keeps the stored request ID after an IdP-initiated response" do
+    test "does not spend the assertion when it restarts the sign-in" do
       setup_provider(Map.put(@unsigned, :allow_idp_initiated_flow, true))
+      claim_check()
+      xml = response_xml(in_response_to: nil)
 
-      conn = post_consume(response_xml(in_response_to: nil), default_session(), "/landing")
-
+      conn = post_consume(xml, default_session(), "/landing")
       assert conn.status == 302
-      assert get_session(conn, "authn_request_id") == "req-1"
 
       pending = post_consume(response_xml(in_response_to: "req-1"), get_session(conn))
-
       assert pending.status == 302
       assert get_resp_header(pending, "location") == ["/home"]
+      assert get_session(pending, "samly_restarted_idp") == nil
+    end
+
+    test "refuses a second unsolicited response in a row" do
+      setup_provider(Map.put(@unsigned, :allow_idp_initiated_flow, true))
+
+      first = post_consume(response_xml(in_response_to: nil), default_session(), "/landing")
+      assert first.status == 302
+
+      second = post_consume(response_xml(in_response_to: nil), get_session(first), "/landing")
+
+      assert second.status == 403
+      assert second.resp_body == "access_denied :unsolicited_response"
+      assert get_session(second, "samly_restarted_idp") == nil
+    end
+
+    test "restarts to / when RelayState is empty or not a local path" do
+      setup_provider(Map.put(@unsigned, :allow_idp_initiated_flow, true))
+
+      for relay_state <- ["", "https://evil.example/x", "//evil.example/x", "/\\evil.example"] do
+        conn = post_consume(response_xml(in_response_to: nil), %{}, relay_state)
+
+        assert get_resp_header(conn, "location") == ["/auth/signin/idp1?target_url=%252F"],
+               "RelayState #{inspect(relay_state)}"
+      end
+    end
+
+    test "keeps the allowed_target_urls check" do
+      setup_provider(
+        @unsigned
+        |> Map.put(:allow_idp_initiated_flow, true)
+        |> Map.put(:allowed_target_urls, ["https://app.example/in"])
+      )
+
+      allowed = post_consume(response_xml(in_response_to: nil), %{}, "https://app.example/in")
+
+      assert get_resp_header(allowed, "location") == [
+               "/auth/signin/idp1?target_url=https%253A%252F%252Fapp.example%252Fin"
+             ]
+
+      refused = post_consume(response_xml(in_response_to: nil), %{}, "/other")
+      assert refused.status == 403
+      assert refused.resp_body == "access_denied :invalid_target_url"
+    end
+
+    test "builds the sign-in path from the mount point" do
+      setup_provider(Map.put(@unsigned, :allow_idp_initiated_flow, true))
+
+      conn =
+        Plug.Test.conn(:post, "/saml2/sp/consume/idp1", %{
+          "SAMLResponse" => Base.encode64(response_xml(in_response_to: nil)),
+          "RelayState" => "/landing"
+        })
+        |> Plug.Test.init_test_session(%{})
+        |> Map.merge(%{script_name: ["saml2"], path_info: ["sp", "consume", "idp1"]})
+        |> Samly.Router.call(Samly.Router.init([]))
+
+      assert get_resp_header(conn, "location") == [
+               "/saml2/auth/signin/idp1?target_url=%252Flanding"
+             ]
     end
   end
 
