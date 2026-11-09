@@ -1,5 +1,13 @@
 # CHANGELOG
 
+### v1.4.0-optify.1
++   Add the `config :samly, :duplicate_check` setting. `Samly` calls the configured function for each valid assertion and refuses a replayed assertion with HTTP 403. With no setting, `Samly` accepts every valid assertion, as before.
++   SP-initiated sign-in stores the AuthnRequest ID in the session. `Samly` refuses a response whose signed `InResponseTo` differs (`access_denied :invalid_in_response_to`). A matching response deletes the stored ID.
+    > A sign-in that started before the upgrade has no stored ID. `Samly` refuses its response one time, and the user must sign in again.
++   Add a test: an unsolicited response stays refused while `allow_idp_initiated_flow` is off.
++   Depend on the Optify `esaml` fork at `v4.6.0-optify.1`. The fork refuses unsafe payloads, for example a payload with a DOCTYPE.
++   The sign-out routes answer a payload that `esaml` refuses. A LogoutResponse gets HTTP 403. A LogoutRequest gets a denied LogoutResponse. Before, both routes failed with a server error.
+
 ### v1.3.0
 +   remove uri double encoding thanks to @DiaanEngelbrecht
 +   fix esaml initialization thanks to @bopm
