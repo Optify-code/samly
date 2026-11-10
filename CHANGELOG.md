@@ -1,5 +1,8 @@
 # CHANGELOG
 
+### v1.4.0-optify.3
++   Fetch the Optify `esaml` fork over HTTPS (`github: "Optify-code/esaml"`). Builds no longer need an SSH key to fetch it.
+
 ### v1.4.0-optify.2
 +   An unsolicited response (no `InResponseTo`) never signs in. Anyone can post their own valid assertion to another user's browser. With `allow_idp_initiated_flow` on, `Samly` sends the browser to `<mount>/auth/signin/<idp_id>` instead, which starts an SP-initiated sign-in at the same IdP. The IdP answers for the user that holds the IdP session. The unsolicited assertion is not claimed, so the duplicate check does not spend it.
 +   A second unsolicited response in a row is refused (`access_denied :unsolicited_response`), so an IdP that never sets `InResponseTo` cannot cause a redirect loop.
