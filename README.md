@@ -326,6 +326,9 @@ defmodule MySamlyPipeline do
     # conn
     # |>  send_resp(404, "attribute mapping failed")
     # |>  halt()
+    #
+    # Halt only before you create a session. See the duplicate check under
+    # "Security Related".
   end
 
   def jit_provision_user(conn, _opts) do
@@ -382,10 +385,15 @@ Take a look at the implementation of `Samly.State.ETS` or `Samly.State.Session` 
     config :samly, :duplicate_release, {MyApp.SAML, :release_assertion, []}
     ```
 
-    `Samly` calls `MyApp.SAML.release_assertion(assertion, digest, ...extra args)` when the `pre_session_create_pipeline` halts or raises, or when the state store raises.
+    `Samly` calls `MyApp.SAML.release_assertion(assertion, digest, ...extra args)` only when the `pre_session_create_pipeline` halts.
     Then no session exists, and a retry of the same response can sign in.
     `Samly` ignores the return value.
     > Without a release function, the claim stays. A retry of the same response is then refused as a duplicate.
+
+    The `pre_session_create_pipeline` must follow this contract:
+    +   Halt only before you create a session. A halt tells `Samly` that the pipeline refused the sign-in, so `Samly` releases the claim.
+    +   After a session exists, do not halt.
+    +   A raise from the pipeline or from the state store always keeps the claim. `Samly` cannot know whether the pipeline already signed the user in, so it fails closed. The same response then cannot be posted again, and the user starts a new sign-in.
 +   SP-initiated sign-in stores the AuthnRequest ID in the session.
     `Samly` reads `InResponseTo` from the signed `SubjectConfirmationData` of the assertion.
     When `InResponseTo` differs from the stored ID, `Samly` refuses the response with HTTP `403 access_denied :invalid_in_response_to`.
@@ -393,7 +401,7 @@ Take a look at the implementation of `Samly.State.ETS` or `Samly.State.Session` 
     +   An accepted SP-initiated response claims its request ID in an ETS table on the node. The claim is atomic.
     +   A second response to the same request ID gets HTTP `403 access_denied :invalid_in_response_to`. This applies to two requests at the same time and to an old session cookie.
     +   An accepted SP-initiated response also deletes the stored ID from the session. An IdP-initiated response does not delete it.
-    +   When the `pre_session_create_pipeline` halts or raises, or the state store raises, `Samly` releases the claim.
+    +   When the `pre_session_create_pipeline` halts, `Samly` releases the claim. A raise from the pipeline or the state store keeps it.
     > The ETS table is local to each node. In a cluster, a response can go to a different node.
     > To make each response single use across the cluster, set the duplicate check above. Claim the digest or `subject.in_response_to` in a shared store.
     > A sign-in that started before the upgrade has no stored ID.

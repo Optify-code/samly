@@ -91,32 +91,27 @@ defmodule Samly.SPHandler do
   end
 
   # Runs the pre-session pipeline and stores the assertion.
-  # When the pipeline halts or raises, or the state store raises, no session
-  # exists. Then samly releases the claims, so a retry is not refused as a
-  # duplicate.
+  # A halt means the pipeline refused the sign-in and wrote no session. Then
+  # samly releases the claims, so a later retry is not refused as a duplicate.
+  # A raise from the pipeline or the state store keeps the claims (fail
+  # closed). samly cannot know whether the pipeline already signed the user in.
   defp accept_or_release(conn, assertion, digest, pipeline) do
     %Assertion{idp_id: idp_id} = assertion
 
-    try do
-      conn =
-        conn
-        |> consume_authn_request_id(assertion)
-        |> put_private(:samly_assertion, assertion)
-        |> pipethrough(pipeline)
+    conn =
+      conn
+      |> consume_authn_request_id(assertion)
+      |> put_private(:samly_assertion, assertion)
+      |> pipethrough(pipeline)
 
-      if conn.halted do
-        Helper.release_assertion(assertion, digest)
-        {:halted, conn}
-      else
-        computed = conn.private[:samly_assertion].computed
-        assertion = %Assertion{assertion | computed: computed, idp_id: idp_id}
-        assertion_key = {idp_id, assertion.subject.name}
-        {:ok, State.put_assertion(conn, assertion_key, assertion), assertion_key}
-      end
-    catch
-      kind, reason ->
-        Helper.release_assertion(assertion, digest)
-        :erlang.raise(kind, reason, __STACKTRACE__)
+    if conn.halted do
+      Helper.release_assertion(assertion, digest)
+      {:halted, conn}
+    else
+      computed = conn.private[:samly_assertion].computed
+      assertion = %Assertion{assertion | computed: computed, idp_id: idp_id}
+      assertion_key = {idp_id, assertion.subject.name}
+      {:ok, State.put_assertion(conn, assertion_key, assertion), assertion_key}
     end
   end
 

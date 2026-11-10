@@ -120,7 +120,7 @@ defmodule Samly.Helper do
   #   1. An SP-initiated response claims its InResponseTo on this node.
   #   2. The function in `config :samly, :duplicate_check` claims the assertion.
   # A refused or failed claim releases the claims that it made before.
-  # release_assertion/2 releases both claims when samly does not accept the assertion.
+  # release_assertion/2 releases both claims when the pre-session pipeline halts.
   @spec claim_assertion(Assertion.t(), binary) ::
           :ok | {:error, :invalid_in_response_to | :duplicate}
   def claim_assertion(%Assertion{} = assertion, digest) do
@@ -143,9 +143,9 @@ defmodule Samly.Helper do
   end
 
   @doc false
-  # Releases the claims of claim_assertion/2. samly calls it when the
-  # pre-session pipeline halts or raises, or when the state store raises.
-  # Then the same response can sign in on a retry.
+  # Releases the claims of claim_assertion/2. samly calls it only when the
+  # pre-session pipeline halts. Then the same response can sign in on a retry.
+  # A raise keeps the claims, because the pipeline may have signed the user in.
   @spec release_assertion(Assertion.t(), binary) :: :ok
   def release_assertion(%Assertion{} = assertion, digest) do
     release_request_id(assertion)

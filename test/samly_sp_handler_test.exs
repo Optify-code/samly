@@ -42,6 +42,16 @@ defmodule SamlySPHandlerTest do
     end
   end
 
+  # A pre-session pipeline that signs the user in and then raises while the
+  # process has :raise_pipeline set, like a post-commit step that fails.
+  defmodule RaisePipeline do
+    def call(conn, _opts) do
+      conn = Plug.Conn.put_private(conn, :signed_in, true)
+      if Process.get(:raise_pipeline), do: raise("post-commit step failed")
+      conn
+    end
+  end
+
   # A state store that raises while the process has :fail_store set.
   defmodule FailingStore do
     @behaviour Samly.State.Store
@@ -181,7 +191,29 @@ defmodule SamlySPHandlerTest do
       assert get_resp_header(conn, "location") == ["/home"]
     end
 
-    test "accepts a retry of a response after the state store fails" do
+    test "keeps the claim when the pre-session pipeline raises" do
+      claim_check()
+      setup_provider(Map.put(@unsigned, :pre_session_create_pipeline, RaisePipeline))
+      xml = response_xml(in_response_to: "req-1")
+
+      Process.put(:raise_pipeline, true)
+
+      error = assert_raise Plug.Conn.WrapperError, fn -> post_consume(xml) end
+      assert %RuntimeError{message: "post-commit step failed"} = error.reason
+
+      Process.delete(:raise_pipeline)
+
+      same_node = post_consume(xml)
+      assert same_node.status == 403
+      assert same_node.resp_body == "access_denied :invalid_in_response_to"
+
+      on_other_node()
+      other_node = post_consume(xml)
+      assert other_node.status == 403
+      assert other_node.resp_body == "access_denied :duplicate"
+    end
+
+    test "keeps the claim when the state store raises" do
       claim_check()
       Samly.State.init(FailingStore)
       xml = response_xml(in_response_to: "req-1")
@@ -192,10 +224,35 @@ defmodule SamlySPHandlerTest do
       assert %RuntimeError{message: "store down"} = error.reason
 
       Process.delete(:fail_store)
-      conn = post_consume(xml)
+
+      same_node = post_consume(xml)
+      assert same_node.status == 403
+      assert same_node.resp_body == "access_denied :invalid_in_response_to"
+
+      on_other_node()
+      other_node = post_consume(xml)
+      assert other_node.status == 403
+      assert other_node.resp_body == "access_denied :duplicate"
+    end
+
+    test "accepts a new sign-in after the pre-session pipeline raises" do
+      claim_check()
+      setup_provider(Map.put(@unsigned, :pre_session_create_pipeline, RaisePipeline))
+
+      Process.put(:raise_pipeline, true)
+
+      assert_raise Plug.Conn.WrapperError, fn ->
+        post_consume(response_xml(in_response_to: "req-1"))
+      end
+
+      Process.delete(:raise_pipeline)
+
+      # A new sign-in has a new AuthnRequest ID and a new assertion.
+      session = Map.put(default_session(), "authn_request_id", "req-2")
+      conn = post_consume(response_xml(in_response_to: "req-2"), session)
 
       assert conn.status == 302
-      assert get_session(conn, "samly_assertion_key") == {"idp1", "user@example.com"}
+      assert get_resp_header(conn, "location") == ["/home"]
     end
 
     test "raises on an invalid duplicate check setting" do
