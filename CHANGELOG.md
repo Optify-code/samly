@@ -1,5 +1,8 @@
 # CHANGELOG
 
+### v1.4.0-optify.4
++   A raise from the `pre_session_create_pipeline` or the state store now keeps the assertion claim: both the request ID on the node and the `duplicate_check` claim. Before, `Samly` released the claim, so a pipeline that signed the user in and then raised let the same response sign in again. `Samly` still releases the claim when the pipeline halts. A pipeline must halt only before it creates a session.
+
 ### v1.4.0-optify.3
 +   Fetch the Optify `esaml` fork over HTTPS (`github: "Optify-code/esaml"`). Builds no longer need an SSH key to fetch it.
 
